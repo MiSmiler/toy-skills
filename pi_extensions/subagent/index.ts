@@ -28,11 +28,12 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 	type ExtensionAPI,
+	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents } from "./agents.ts";
-import { buildContent } from "./clean-return.ts";
+import { buildContent, type CleanResult } from "./clean-return.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
@@ -72,7 +73,7 @@ function formatUsageStats(
 function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
+	themeFg: (color: ThemeColor, text: string) => string,
 ): string {
 	const shortenPath = (p: string) => {
 		const home = os.homedir();
@@ -205,6 +206,17 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 	return items;
 }
 
+/** Map a subagent result to the clean-return module's input shape. */
+function toCleanResult(r: SingleResult): CleanResult {
+	return {
+		exitCode: r.exitCode,
+		stopReason: r.stopReason,
+		errorMessage: r.errorMessage,
+		stderr: r.stderr,
+		finalOutput: getFinalOutput(r.messages),
+	};
+}
+
 async function writePromptToTempFile(
 	agentName: string,
 	prompt: string,
@@ -326,7 +338,7 @@ async function runSingleAgent(
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
-				let event: any;
+				let event: { type?: string; message?: Message };
 				try {
 					event = JSON.parse(line);
 				} catch {
@@ -395,7 +407,10 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		if (wasAborted) {
+			currentResult.stopReason = "aborted";
+			currentResult.errorMessage = "Subagent was aborted";
+		}
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -452,18 +467,11 @@ export default function (pi: ExtensionAPI) {
 				makeDetails,
 			);
 
-			const built = buildContent({
-				exitCode: result.exitCode,
-				stopReason: result.stopReason,
-				errorMessage: result.errorMessage,
-				stderr: result.stderr,
-				finalOutput: getFinalOutput(result.messages),
-			});
+			const builtContent = buildContent(toCleanResult(result));
 
 			return {
-				content: [{ type: "text", text: built.content }],
+				content: [{ type: "text", text: builtContent.content }],
 				details: makeDetails([result]),
-				...(built.isError ? { isError: true } : {}),
 			};
 		},
 
@@ -512,17 +520,10 @@ export default function (pi: ExtensionAPI) {
 			// Use the same clean-return contract as `execute` so the rendered
 			// status icon and error text never disagree with the `content` the
 			// model actually received.
-			const built = buildContent({
-				exitCode: r.exitCode,
-				stopReason: r.stopReason,
-				errorMessage: r.errorMessage,
-				stderr: r.stderr,
-				finalOutput: getFinalOutput(r.messages),
-			});
-			const isError = built.isError;
+			const builtContent = buildContent(toCleanResult(r));
+			const isError = builtContent.isError;
 			const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 			const displayItems = getDisplayItems(r.messages);
-			const finalOutput = getFinalOutput(r.messages);
 
 			if (expanded) {
 				const container = new Container();
@@ -530,29 +531,30 @@ export default function (pi: ExtensionAPI) {
 				if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				container.addChild(new Text(header, 0, 0));
 				if (isError)
-					container.addChild(new Text(theme.fg("error", `Error: ${built.content}`), 0, 0));
+					container.addChild(new Text(theme.fg("error", `Error: ${builtContent.content}`), 0, 0));
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 				container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-				if (displayItems.length === 0 && !finalOutput) {
+
+				const toolCalls = displayItems.filter((i) => i.type === "toolCall");
+				const showCleanOutput = !isError && builtContent.content.length > 0;
+				if (toolCalls.length === 0 && !showCleanOutput) {
 					container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
 				} else {
-					for (const item of displayItems) {
-						if (item.type === "toolCall")
-							container.addChild(
-								new Text(
-									theme.fg("muted", "→ ") +
-										formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-									0,
-									0,
-								),
-							);
-					}
-					if (finalOutput) {
+					for (const item of toolCalls)
+						container.addChild(
+							new Text(
+								theme.fg("muted", "→ ") +
+									formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+								0,
+								0,
+							),
+						);
+					if (showCleanOutput) {
 						container.addChild(new Spacer(1));
-						container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
+						container.addChild(new Markdown(builtContent.content, 0, 0, mdTheme));
 					}
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
@@ -565,7 +567,7 @@ export default function (pi: ExtensionAPI) {
 
 			let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 			if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-			if (isError) text += `\n${theme.fg("error", `Error: ${built.content}`)}`;
+			if (isError) text += `\n${theme.fg("error", `Error: ${builtContent.content}`)}`;
 			else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 			else {
 				text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
@@ -576,5 +578,18 @@ export default function (pi: ExtensionAPI) {
 			if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 			return new Text(text, 0, 0);
 		},
+	});
+
+	// pi ignores a returned `isError` from `execute` (a normal return always
+	// leaves the result unflagged); only a throw from `execute` sets it. To flag
+	// a subagent failure without losing the transcript kept in `details`, derive
+	// the clean-return contract here and patch `isError` post-hoc.
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "subagent") return;
+		const details = event.details as SubagentDetails | undefined;
+		const r = details?.results[0];
+		if (!r) return;
+		const builtContent = buildContent(toCleanResult(r));
+		if (builtContent.isError) return { isError: true };
 	});
 }
