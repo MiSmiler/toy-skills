@@ -51,6 +51,12 @@ Absolute paths and `~` are supported. Then run `/reload` in pi.
 |------|-------------|--------------|
 | `level-picker.ts` | Select the current model's thinking level in the editor slot | `alt+l`, `/level` |
 | `write-guard.ts` | Confirm `write` tool calls before execution | auto |
+| `subagent/` | Delegate a task to a bundled role (`scout` / `reviewer` / `worker`) in an isolated `pi` subprocess; returns only the clean `<final_result>` | tool `subagent` |
+
+> `subagent/` is a multi-file extension (entry module + discovery + clean-return
+> module + bundled role Markdown), so it must be installed as a **directory**
+> named `subagent` containing `index.ts` (copy or symlink the whole directory,
+> not a single file). See `pi_extensions/subagent/README.md`.
 
 ### Why `alt+l` instead of `ctrl+shift+l`?
 

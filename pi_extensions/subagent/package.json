@@ -1,0 +1,9 @@
+{
+  "name": "pi-subagent-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test clean-return.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
