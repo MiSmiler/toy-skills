@@ -2,8 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
 	MISSING_FINAL_RESULT_MESSAGE,
+	buildChainContent,
 	buildContent,
+	buildParallelContent,
 	extractFinalResult,
+	injectPrevious,
 	isFailedResult,
 } from "./clean-return.ts";
 
@@ -115,5 +118,204 @@ describe("buildContent", () => {
 	it("falls back to (no output) when a failure has no message at all", () => {
 		const built = buildContent({ exitCode: 3, stderr: "", finalOutput: "" });
 		assert.deepEqual(built, { content: "(no output)", isError: true });
+	});
+});
+
+describe("injectPrevious", () => {
+	it("replaces the {previous} placeholder with the given clean content", () => {
+		assert.equal(
+			injectPrevious("Summarize:\n{previous}", "## Findings\n- a"),
+			"Summarize:\n## Findings\n- a",
+		);
+	});
+
+	it("leaves a task with no placeholder untouched", () => {
+		assert.equal(
+			injectPrevious("Investigate the login flow", "anything"),
+			"Investigate the login flow",
+		);
+	});
+
+	it("replaces every occurrence of the placeholder", () => {
+		assert.equal(injectPrevious("{previous} then {previous}", "X"), "X then X");
+	});
+
+	it("removes the placeholder entirely when the previous content is empty", () => {
+		assert.equal(injectPrevious("start{previous}end", ""), "startend");
+	});
+});
+
+describe("buildParallelContent", () => {
+	it("aggregates successful tasks under a header line", () => {
+		const built = buildParallelContent([
+			{
+				agent: "scout",
+				result: {
+					exitCode: 0,
+					stderr: "",
+					finalOutput: "<final_result>## Recon\na</final_result>",
+				},
+			},
+			{
+				agent: "worker",
+				result: {
+					exitCode: 0,
+					stderr: "",
+					finalOutput: "<final_result>## Done\nb</final_result>",
+				},
+			},
+		]);
+		assert.equal(built.isError, false);
+		assert.equal(
+			built.content,
+			"Parallel: 2 tasks, 2 succeeded, 0 failed\n\n" +
+				"### Task 1 — scout (ok)\n## Recon\na\n\n" +
+				"### Task 2 — worker (ok)\n## Done\nb",
+		);
+	});
+
+	it("uses the singular 'task' for a single task", () => {
+		const built = buildParallelContent([
+			{
+				agent: "scout",
+				result: {
+					exitCode: 0,
+					stderr: "",
+					finalOutput: "<final_result>ok</final_result>",
+				},
+			},
+		]);
+		assert.equal(built.isError, false);
+		assert.equal(
+			built.content,
+			"Parallel: 1 task, 1 succeeded, 0 failed\n\n### Task 1 — scout (ok)\nok",
+		);
+	});
+
+	it("sets isError and surfaces each failure when any task fails", () => {
+		const built = buildParallelContent([
+			{
+				agent: "scout",
+				result: {
+					exitCode: 0,
+					stderr: "",
+					finalOutput: "<final_result>ok</final_result>",
+				},
+			},
+			{
+				agent: "reviewer",
+				result: {
+					exitCode: 1,
+					stderr: "reviewer boom",
+					finalOutput: "",
+				},
+			},
+		]);
+		assert.equal(built.isError, true);
+		assert.equal(
+			built.content,
+			"Parallel: 2 tasks, 1 succeeded, 1 failed\n\n" +
+				"### Task 1 — scout (ok)\nok\n\n" +
+				"### Task 2 — reviewer (failed)\nreviewer boom",
+		);
+	});
+
+	it("reports an empty task list as an error", () => {
+		const built = buildParallelContent([]);
+		assert.deepEqual(built, {
+			content: "No parallel tasks were provided.",
+			isError: true,
+		});
+	});
+});
+
+describe("buildChainContent", () => {
+	it("returns the last step's clean content on full success", () => {
+		const built = buildChainContent(
+			[
+				{
+					agent: "scout",
+					result: {
+						exitCode: 0,
+						stderr: "",
+						finalOutput: "<final_result>step one</final_result>",
+					},
+				},
+				{
+					agent: "worker",
+					result: {
+						exitCode: 0,
+						stderr: "",
+						finalOutput: "<final_result>step two</final_result>",
+					},
+				},
+			],
+			null,
+		);
+		assert.deepEqual(built, { content: "step two", isError: false });
+	});
+
+	it("names the failing step and surfaces its real error", () => {
+		const built = buildChainContent(
+			[
+				{
+					agent: "scout",
+					result: {
+						exitCode: 0,
+						stderr: "",
+						finalOutput: "<final_result>step one</final_result>",
+					},
+				},
+				{
+					agent: "reviewer",
+					result: {
+						exitCode: 1,
+						stderr: "review failed",
+						finalOutput: "",
+					},
+				},
+			],
+			1,
+		);
+		assert.deepEqual(built, {
+			content: "Chain step 2 (reviewer) failed:\nreview failed",
+			isError: true,
+		});
+	});
+
+	it("reports an empty chain as an error", () => {
+		const built = buildChainContent([], null);
+		assert.deepEqual(built, {
+			content: "No chain steps were provided.",
+			isError: true,
+		});
+	});
+
+	it("flags isError when the last successful step emits no <final_result>", () => {
+		const built = buildChainContent(
+			[
+				{
+					agent: "scout",
+					result: {
+						exitCode: 0,
+						stderr: "",
+						finalOutput: "<final_result>ok</final_result>",
+					},
+				},
+				{
+					agent: "worker",
+					result: {
+						exitCode: 0,
+						stderr: "",
+						finalOutput: "done but no tag",
+					},
+				},
+			],
+			null,
+		);
+		assert.deepEqual(built, {
+			content: MISSING_FINAL_RESULT_MESSAGE,
+			isError: true,
+		});
 	});
 });

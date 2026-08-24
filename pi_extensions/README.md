@@ -51,7 +51,7 @@ Absolute paths and `~` are supported. Then run `/reload` in pi.
 |------|-------------|--------------|
 | `level-picker.ts` | Select the current model's thinking level in the editor slot | `alt+l`, `/level` |
 | `write-guard.ts` | Confirm `write` tool calls before execution | auto |
-| `subagent/` | Delegate a task to a bundled role (`scout` / `reviewer` / `worker`) in an isolated `pi` subprocess; returns only the clean `<final_result>` | tool `subagent` |
+| `subagent/` | Delegate to bundled roles (`scout` / `reviewer` / `worker`) in isolated `pi` subprocesses: single `{ agent, task }`, parallel `{ tasks[] }` (capped at 4), or chain `{ chain[] }` with `{previous}` injection; returns clean `<final_result>`s | tool `subagent` |
 
 > `subagent/` is a multi-file extension (entry module + discovery + clean-return
 > module + bundled role Markdown), so it must be installed as a **directory**

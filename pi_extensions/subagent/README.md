@@ -1,20 +1,34 @@
 # Subagent
 
-Single-mode subagent tool. Delegate a task to one of three bundled roles —
-`scout`, `reviewer`, `worker` — which runs in its own isolated `pi` subprocess
-(isolated context, so the parent session stays clean). Only the role's clean
+Multimode subagent tool. Delegate work to one of three bundled roles — `scout`,
+`reviewer`, `worker` — each in its own isolated `pi` subprocess (isolated
+context, so the parent session stays clean). Only the roles' clean
 `<final_result>` inner Markdown comes back as the tool's `content`; the full
-transcript stays in `details` for the collapsed / expanded (Ctrl+O) view.
+transcripts stay in `details` for the collapsed / expanded (Ctrl+O) view.
 
-Single mode only: `{ agent, task }`. (Parallel fan-out and chained pipelines are
-a separate, later ticket and are not wired here.)
+Three dispatch modes:
+
+- **Single**: `{ agent, task }` — one role runs, returns its clean `<final_result>`.
+- **Parallel**: `{ tasks: [...] }` — independent tasks fan out concurrently,
+  capped at **4** tasks per call and **3** concurrent subprocesses. `content` is
+  a header line plus each task's clean content under a per-task heading.
+- **Chain**: `{ chain: [...] }` — steps run in order; each step's `{previous}`
+  placeholder is replaced with the previous step's clean `<final_result>`
+  content. The pipeline stops at the first failed step and names it.
 
 ## What comes back
 
-- **On success**: `content` is the inner Markdown of the **last**
-  `<final_result>...</final_result>` block in the final assistant text. `details`
-  is `{ mode: "single", results }` — the full transcript for the TUI view,
-  never fed back to the model.
+- **Single, on success**: `content` is the inner Markdown of the **last**
+  `<final_result>...</final_result>` block in the final assistant text.
+- **Parallel**: `content` = a header line (`Parallel: N tasks, X succeeded, Y
+  failed`) + each task's clean content (or its real error text) labelled by
+  index and agent. `isError` is set when **any** task fails.
+- **Chain, on success**: `content` is the **last** step's clean
+  `<final_result>` — the pipeline's final output. On a failed step, the pipeline
+  stops, `content` names the failed step (1-based index + agent) and surfaces
+  its real error, and `isError` is set.
+- **`details`** is `{ mode, results, failedIndex? }` — the full per-run
+  transcript(s) for the TUI view, never fed back to the model.
 - **On genuine failure** (nonzero exit / error stop reason / aborted): `isError`
   is set and `content` is the real error text (`errorMessage` / `stderr` /
   output). A clean summary never masks a failure.

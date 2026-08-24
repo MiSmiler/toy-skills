@@ -33,9 +33,18 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents } from "./agents.ts";
-import { buildContent, type CleanResult } from "./clean-return.ts";
+import {
+	buildChainContent,
+	buildContent,
+	buildParallelContent,
+	injectPrevious,
+	type CleanResult,
+	type ParallelTaskResult,
+} from "./clean-return.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
+const MAX_PARALLEL_TASKS = 4;
+const MAX_PARALLEL_CONCURRENCY = 3;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -170,9 +179,20 @@ interface SingleResult {
 	errorMessage?: string;
 }
 
+type SubagentMode = "single" | "parallel" | "chain";
+
+/** One unit of work handed to a bundled role: the role to invoke, its task, and an optional cwd. */
+interface SubagentTaskInput {
+	agent: string;
+	task: string;
+	cwd?: string;
+}
+
 interface SubagentDetails {
-	mode: "single";
+	mode: SubagentMode;
 	results: SingleResult[];
+	/** For `chain` mode, the 0-based index of the step that failed (pipeline stopped there), if any. */
+	failedIndex?: number | null;
 }
 
 /** The last assistant text part of a final assistant message, if any. */
@@ -262,7 +282,6 @@ async function runSingleAgent(
 	cwd: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -311,7 +330,7 @@ async function runSingleAgent(
 				content: [
 					{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" },
 				],
-				details: makeDetails([currentResult]),
+				details: { mode: "single", results: [currentResult], failedIndex: null },
 			});
 		}
 	};
@@ -428,19 +447,159 @@ async function runSingleAgent(
 	}
 }
 
-const SubagentParams = Type.Object({
+/** Map completed subagent runs to the clean-return module's labelled aggregation shape. */
+function toParallelTaskResults(results: SingleResult[]): ParallelTaskResult[] {
+	return results.map((r) => ({ agent: r.agent, result: toCleanResult(r) }));
+}
+
+/**
+ * Run independent tasks concurrently, capped at {@link MAX_PARALLEL_TASKS} tasks
+ * per call and {@link MAX_PARALLEL_CONCURRENCY} in-flight subprocesses. Returns
+ * results in task order (holes are never left: every worker drains the whole
+ * queue). Streaming updates re-aggregate the completed results so far.
+ */
+async function runParallel(
+	defaultCwd: string,
+	dispatchDefaults: DispatchDefaults,
+	agents: AgentConfig[],
+	tasks: SubagentTaskInput[],
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+): Promise<SingleResult[]> {
+	const capped = tasks.slice(0, MAX_PARALLEL_TASKS);
+	const results: (SingleResult | undefined)[] = new Array(capped.length);
+
+	const emit = () => {
+		if (!onUpdate) return;
+		const done = results.filter((r): r is SingleResult => r !== undefined);
+		const built = buildParallelContent(toParallelTaskResults(done));
+		onUpdate({
+			content: [{ type: "text", text: built.content }],
+			details: { mode: "parallel", results: done, failedIndex: null },
+		});
+	};
+
+	let nextIndex = 0;
+	async function worker(): Promise<void> {
+		while (nextIndex < capped.length && !signal?.aborted) {
+			const idx = nextIndex++;
+			const task = capped[idx];
+			const result = await runSingleAgent(
+				defaultCwd,
+				dispatchDefaults,
+				agents,
+				task.agent,
+				task.task,
+				task.cwd,
+				signal,
+				undefined,
+			);
+			results[idx] = result;
+			emit();
+		}
+	}
+
+	const workerCount = Math.min(MAX_PARALLEL_CONCURRENCY, capped.length);
+	await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+	return results as SingleResult[];
+}
+
+interface ChainOutcome {
+	results: SingleResult[];
+	failedIndex: number | null;
+}
+
+/**
+ * Run a chained pipeline in order. Each step's `{previous}` placeholder is
+ * replaced with the previous (successful) step's clean `<final_result>` content
+ * before dispatch; the pipeline stops at the first failed step, which the caller
+ * is told about so it can report it. Streaming updates reflect the steps
+ * completed so far.
+ */
+async function runChain(
+	defaultCwd: string,
+	dispatchDefaults: DispatchDefaults,
+	agents: AgentConfig[],
+	steps: SubagentTaskInput[],
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+): Promise<ChainOutcome> {
+	const results: SingleResult[] = [];
+	let previousContent = "";
+	let failedIndex: number | null = null;
+
+	const emit = () => {
+		if (!onUpdate) return;
+		const built = buildChainContent(toParallelTaskResults(results), failedIndex);
+		onUpdate({
+			content: [{ type: "text", text: built.content }],
+			details: { mode: "chain", results: [...results], failedIndex },
+		});
+	};
+
+	for (let i = 0; i < steps.length; i++) {
+		if (signal?.aborted) break;
+		const step = steps[i];
+		const task = injectPrevious(step.task, previousContent);
+		const result = await runSingleAgent(
+			defaultCwd,
+			dispatchDefaults,
+			agents,
+			step.agent,
+			task,
+			step.cwd,
+			signal,
+			undefined,
+		);
+		results.push(result);
+		const built = buildContent(toCleanResult(result));
+		if (built.isError) {
+			failedIndex = i;
+			emit();
+			break;
+		}
+		previousContent = built.content;
+		emit();
+	}
+
+	return { results, failedIndex };
+}
+
+const SubagentTaskParams = Type.Object({
 	agent: Type.String({ description: "Role to invoke: scout / reviewer / worker." }),
 	task: Type.String({ description: "Task to delegate to the role." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process." })),
 });
+
+const ParallelModeParams = Type.Object({
+	tasks: Type.Array(SubagentTaskParams, {
+		description: "Independent tasks to fan out concurrently (capped at 4).",
+	}),
+});
+
+const ChainModeParams = Type.Object({
+	chain: Type.Array(SubagentTaskParams, {
+		description: "Chained steps run in order; each may reference the previous step via {previous}.",
+	}),
+});
+
+const SubagentParams = Type.Union([
+	SubagentTaskParams,
+	ParallelModeParams,
+	ChainModeParams,
+]);
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Delegate a task to a bundled role (scout / reviewer / worker) with isolated context.",
-			"Returns only the role's clean <final_result> inner Markdown; the full transcript is kept in details.",
+			"Delegate tasks to bundled roles (scout / reviewer / worker) in isolated contexts.",
+			"Single: { agent, task } returns the clean <final_result> inner Markdown.",
+			"Parallel: { tasks[] } fans out independent tasks concurrently (capped at 4 tasks).",
+			"Chain: { chain[] } runs steps in order, injecting each step's {previous} content.",
+			"Full transcripts are kept in details.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -450,11 +609,43 @@ export default function (pi: ExtensionAPI) {
 				thinkingLevel: ctx.thinkingLevel,
 			};
 			const agents = discoverAgents();
-			const makeDetails = (results: SingleResult[]): SubagentDetails => ({
-				mode: "single",
-				results,
-			});
 
+			if ("tasks" in params) {
+				const results = await runParallel(
+					ctx.cwd,
+					dispatchDefaults,
+					agents,
+					params.tasks,
+					signal,
+					onUpdate,
+				);
+				const builtContent = buildParallelContent(toParallelTaskResults(results));
+				return {
+					content: [{ type: "text", text: builtContent.content }],
+					details: { mode: "parallel", results, failedIndex: null },
+				};
+			}
+
+			if ("chain" in params) {
+				const { results, failedIndex } = await runChain(
+					ctx.cwd,
+					dispatchDefaults,
+					agents,
+					params.chain,
+					signal,
+					onUpdate,
+				);
+				const builtContent = buildChainContent(
+					toParallelTaskResults(results),
+					failedIndex,
+				);
+				return {
+					content: [{ type: "text", text: builtContent.content }],
+					details: { mode: "chain", results, failedIndex },
+				};
+			}
+
+			// Single mode.
 			const result = await runSingleAgent(
 				ctx.cwd,
 				dispatchDefaults,
@@ -464,18 +655,42 @@ export default function (pi: ExtensionAPI) {
 				params.cwd,
 				signal,
 				onUpdate,
-				makeDetails,
 			);
-
 			const builtContent = buildContent(toCleanResult(result));
-
 			return {
 				content: [{ type: "text", text: builtContent.content }],
-				details: makeDetails([result]),
+				details: { mode: "single", results: [result], failedIndex: null },
 			};
 		},
 
 		renderCall(args, theme, _context) {
+			if ("tasks" in args) {
+				const total = args.tasks.length;
+				const capped = Math.min(total, MAX_PARALLEL_TASKS);
+				const note =
+					total > MAX_PARALLEL_TASKS
+						? theme.fg("warning", ` (capped to ${MAX_PARALLEL_TASKS})`)
+						: "";
+				const names = args.tasks.map((t) => t.agent).join(", ") || "...";
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", "parallel") +
+					theme.fg("muted", ` [${capped} task${capped === 1 ? "" : "s"}${note}]`);
+				text += `\n  ${theme.fg("dim", names)}`;
+				return new Text(text, 0, 0);
+			}
+
+			if ("chain" in args) {
+				const count = args.chain.length;
+				const names = args.chain.map((t) => t.agent).join(" → ") || "...";
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", "chain") +
+					theme.fg("muted", ` [${count} step${count === 1 ? "" : "s"}]`);
+				text += `\n  ${theme.fg("dim", names)}`;
+				return new Text(text, 0, 0);
+			}
+
 			const agentName = args.agent || "...";
 			const preview =
 				args.task && args.task.length > 60
@@ -497,7 +712,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mdTheme = getMarkdownTheme();
-			const r = details.results[0];
+			const modeLabel = details.mode;
+			const multiple = details.results.length > 1;
 
 			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
 				const toShow = limit ? items.slice(-limit) : items;
@@ -517,27 +733,37 @@ export default function (pi: ExtensionAPI) {
 				return text.trimEnd();
 			};
 
-			// Use the same clean-return contract as `execute` so the rendered
-			// status icon and error text never disagree with the `content` the
-			// model actually received.
-			const builtContent = buildContent(toCleanResult(r));
-			const isError = builtContent.isError;
-			const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-			const displayItems = getDisplayItems(r.messages);
+			// Render one subagent result's expanded section. Uses the same
+			// clean-return contract as `execute` so the rendered status icon and
+			// error text never disagree with the `content` the model received.
+			const presentSection = (container: Container, r: SingleResult, index: number) => {
+				const builtContent = buildContent(toCleanResult(r));
+				const isError = builtContent.isError;
+				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 
-			if (expanded) {
-				const container = new Container();
+				if (multiple) {
+					container.addChild(
+						new Text(
+							theme.fg("accent", `─── ${modeLabel} result ${index + 1} — ${r.agent} ───`),
+							0,
+							0,
+						),
+					);
+				}
+
 				let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				container.addChild(new Text(header, 0, 0));
 				if (isError)
 					container.addChild(new Text(theme.fg("error", `Error: ${builtContent.content}`), 0, 0));
+
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
 				container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
 
+				const displayItems = getDisplayItems(r.messages);
 				const toolCalls = displayItems.filter((i) => i.type === "toolCall");
 				const showCleanOutput = !isError && builtContent.content.length > 0;
 				if (toolCalls.length === 0 && !showCleanOutput) {
@@ -562,20 +788,65 @@ export default function (pi: ExtensionAPI) {
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
 				}
+			};
+
+			if (expanded) {
+				const container = new Container();
+				if (multiple) {
+					const count = details.results.length;
+					container.addChild(
+						new Text(
+							theme.fg("toolTitle", theme.bold(`subagent ${modeLabel}`)) +
+								theme.fg("muted", ` (${count} result${count === 1 ? "" : "s"})`),
+							0,
+							0,
+						),
+					);
+				}
+				if (details.mode === "chain" && details.failedIndex != null) {
+					container.addChild(
+						new Text(
+							theme.fg("error", `Pipeline stopped at step ${details.failedIndex + 1}`),
+							0,
+							0,
+						),
+					);
+				}
+				details.results.forEach((r, i) => {
+					if (i > 0) container.addChild(new Spacer(1));
+					presentSection(container, r, i);
+				});
 				return container;
 			}
 
-			let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-			if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-			if (isError) text += `\n${theme.fg("error", `Error: ${builtContent.content}`)}`;
-			else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-			else {
-				text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-				if (displayItems.length > COLLAPSED_ITEM_COUNT)
-					text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-			}
-			const usageStr = formatUsageStats(r.usage, r.model);
-			if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+			// Collapsed: one compact line per result, all concatenated.
+			let text = "";
+			details.results.forEach((r, i) => {
+				const builtContent = buildContent(toCleanResult(r));
+				const isError = builtContent.isError;
+				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const heading = multiple
+					? `${theme.fg("accent", `${modeLabel} ${i + 1}: `)}`
+					: "";
+				let line = `${heading}${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+				if (isError && r.stopReason) line += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				if (isError) {
+					line += `\n${theme.fg("error", `Error: ${builtContent.content}`)}`;
+				} else {
+					const displayItems = getDisplayItems(r.messages);
+					if (displayItems.length === 0) {
+						line += `\n${theme.fg("muted", "(no output)")}`;
+					} else {
+						line += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
+						if (displayItems.length > COLLAPSED_ITEM_COUNT)
+							line += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+					}
+				}
+				const usageStr = formatUsageStats(r.usage, r.model);
+				if (usageStr) line += `\n${theme.fg("dim", usageStr)}`;
+				if (text) text += "\n\n";
+				text += line;
+			});
 			return new Text(text, 0, 0);
 		},
 	});
@@ -587,9 +858,21 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_result", (event) => {
 		if (event.toolName !== "subagent") return;
 		const details = event.details as SubagentDetails | undefined;
-		const r = details?.results[0];
-		if (!r) return;
-		const builtContent = buildContent(toCleanResult(r));
-		if (builtContent.isError) return { isError: true };
+		if (!details || details.results.length === 0) return;
+
+		let isError = false;
+		if (details.mode === "single") {
+			const r = details.results[0];
+			if (r) isError = buildContent(toCleanResult(r)).isError;
+		} else if (details.mode === "parallel") {
+			isError = buildParallelContent(toParallelTaskResults(details.results)).isError;
+		} else if (details.mode === "chain") {
+			isError = buildChainContent(
+				toParallelTaskResults(details.results),
+				details.failedIndex ?? null,
+			).isError;
+		}
+
+		if (isError) return { isError: true };
 	});
 }
