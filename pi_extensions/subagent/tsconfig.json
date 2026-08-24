@@ -22,5 +22,5 @@
       "typebox": ["/home/hui/.nvm/versions/node/v26.7.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"]
     }
   },
-  "include": ["index.ts", "agents.ts", "clean-return.ts", "clean-return.test.ts"]
+  "include": ["index.ts", "agents.ts", "clean-return.ts", "clean-return.test.ts", "context-files.ts", "context-files.test.ts"]
 }

@@ -25,6 +25,7 @@ import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import {
+	getAgentDir,
 	getMarkdownTheme,
 	withFileMutationQueue,
 	type ExtensionAPI,
@@ -33,6 +34,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents } from "./agents.ts";
+import { resolveUserContextFile } from "./context-files.ts";
 import {
 	buildChainContent,
 	buildContent,
@@ -298,7 +300,10 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	// Suppress every auto-loaded context file (global + project + ancestor
+	// AGENTS.md / CLAUDE.md): the child subagent must not inherit the repo's
+	// workflow rules. The user-level file is re-injected separately below.
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-context-files"];
 	// Roles omit `model` in their frontmatter, so they inherit the dispatching
 	// session's model. An optional per-role override still wins.
 	const model = agent.model ?? dispatchDefaults.model;
@@ -341,6 +346,17 @@ async function runSingleAgent(
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
+		}
+
+		// Re-inject only the user-level context file (honoring pi's precedence,
+		// AGENTS.override.md > AGENTS.md > CLAUDE.md) so the subagent still obeys
+		// the user's standing language / terminology rules, while staying blind to
+		// the project / ancestor AGENTS.md that --no-context-files suppressed.
+		// Multiple --append-system-prompt values are joined with "\n\n", so the
+		// role's agent body and the user-level file coexist in the system prompt.
+		const userContextFile = resolveUserContextFile(getAgentDir());
+		if (userContextFile) {
+			args.push("--append-system-prompt", userContextFile);
 		}
 
 		args.push(`Task: ${task}`);

@@ -39,6 +39,18 @@ Each role inherits the parent session's model (no hardcoded provider pins) and
 shares the full toolset `read, bash, edit, write, grep, find, ls`. `subagent`
 is not in that list, so subagents cannot nest.
 
+## Context files
+
+Each role runs in an isolated `pi` subprocess launched with `--no-context-files`,
+so subagents never auto-load the project / ancestor `AGENTS.md` or `CLAUDE.md`
+— those describe the parent's workflow, not a scoped subagent's narrow job. Only
+the **user-level** `~/.pi/agent/AGENTS.md` (or `AGENTS.override.md` when present)
+is re-injected via `--append-system-prompt`, honoring pi's precedence
+(`AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md`), so the subagent still obeys
+the user's standing language / terminology rules. The role's agent body
+(`agents/*.md`) is appended alongside it, so the role persona + output contract
+still apply.
+
 ## Install
 
 This is a multi-file extension (entry module + discovery + clean-return module +
@@ -51,6 +63,7 @@ mkdir -p ~/.pi/agent/extensions/subagent
 cp -r ./pi_extensions/subagent/index.ts \
       ./pi_extensions/subagent/agents.ts \
       ./pi_extensions/subagent/clean-return.ts \
+      ./pi_extensions/subagent/context-files.ts \
       ./pi_extensions/subagent/agents \
       ~/.pi/agent/extensions/subagent/
 ```

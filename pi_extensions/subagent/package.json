@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test clean-return.test.ts",
+    "test": "node --test clean-return.test.ts context-files.test.ts",
     "typecheck": "tsc -p tsconfig.json"
   }
 }
