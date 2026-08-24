@@ -588,23 +588,22 @@ const SubagentTaskParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process." })),
 });
 
-const ParallelModeParams = Type.Object({
-	tasks: Type.Array(SubagentTaskParams, {
-		description: "Independent tasks to fan out concurrently (capped at 4).",
-	}),
+// OpenAI function schemas require a single top-level `type: "object"`; a
+// `Type.Union` serialises to `{ anyOf: [...] }` with no top-level `type` and is
+// rejected by the API. So the three call shapes (single / parallel / chain) are
+// modelled as optional fields on one object, and `execute` dispatches on which
+// key is present.
+const SubagentParams = Type.Object({
+	agent: Type.Optional(Type.String({ description: "Role to invoke (single mode): scout / reviewer / worker." })),
+	task: Type.Optional(Type.String({ description: "Task to delegate (single mode)." })),
+	tasks: Type.Optional(Type.Array(SubagentTaskParams, {
+		description: "Independent tasks to fan out concurrently (parallel mode, capped at 4).",
+	})),
+	chain: Type.Optional(Type.Array(SubagentTaskParams, {
+		description: "Chained steps run in order (chain mode); each may reference the previous step via {previous}.",
+	})),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process." })),
 });
-
-const ChainModeParams = Type.Object({
-	chain: Type.Array(SubagentTaskParams, {
-		description: "Chained steps run in order; each may reference the previous step via {previous}.",
-	}),
-});
-
-const SubagentParams = Type.Union([
-	SubagentTaskParams,
-	ParallelModeParams,
-	ChainModeParams,
-]);
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
@@ -626,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			const agents = discoverAgents();
 
-			if ("tasks" in params) {
+			if (Array.isArray(params.tasks)) {
 				const results = await runParallel(
 					ctx.cwd,
 					dispatchDefaults,
@@ -642,7 +641,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ("chain" in params) {
+			if (Array.isArray(params.chain)) {
 				const { results, failedIndex } = await runChain(
 					ctx.cwd,
 					dispatchDefaults,
@@ -662,12 +661,17 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Single mode.
+			const agentName = params.agent;
+			const task = params.task;
+			if (typeof agentName !== "string" || typeof task !== "string") {
+				throw new Error('subagent single mode requires both "agent" and "task".');
+			}
 			const result = await runSingleAgent(
 				ctx.cwd,
 				dispatchDefaults,
 				agents,
-				params.agent,
-				params.task,
+				agentName,
+				task,
 				params.cwd,
 				signal,
 				onUpdate,
@@ -680,7 +684,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			if ("tasks" in args) {
+			if (Array.isArray(args.tasks)) {
 				const total = args.tasks.length;
 				const capped = Math.min(total, MAX_PARALLEL_TASKS);
 				const note =
@@ -696,7 +700,7 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			}
 
-			if ("chain" in args) {
+			if (Array.isArray(args.chain)) {
 				const count = args.chain.length;
 				const names = args.chain.map((t) => t.agent).join(" → ") || "...";
 				let text =
