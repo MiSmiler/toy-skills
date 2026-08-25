@@ -16,6 +16,15 @@ Three dispatch modes:
   placeholder is replaced with the previous step's clean `<final_result>`
   content. The pipeline stops at the first failed step and names it.
 
+## Session counter
+
+While the session is open, the footer status line shows how many times each
+role has been invoked this session, e.g. `scout:0 reviewer:5 worker:2` (always
+all three slots, zero included). A role counts once each time it is actually
+dispatched to a subprocess. The counter is **in-memory only**: the extension
+module is re-instantiated on every session transition, so it resets when a new
+or resumed session starts — nothing is written to disk.
+
 ## What comes back
 
 - **Single, on success**: `content` is the inner Markdown of the **last**
@@ -79,6 +88,6 @@ no reload is needed to change them.
 npm test
 ```
 
-Runs the clean-return module's tests with the built-in `node:test` runner and
-Node's native TypeScript type-stripping (no pi runtime import, no extra
-loader).
+Runs the clean-return, context-files, and role-counts modules' tests with the
+built-in `node:test` runner and Node's native TypeScript type-stripping (no pi
+runtime import, no extra loader).

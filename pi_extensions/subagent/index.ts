@@ -14,6 +14,12 @@
  * successful run that never emitted a `<final_result>` block, sets `isError`
  * with the real error — a clean summary never masks a failure.
  *
+ * While the session is open, a per-role invocation counter (`scout` /
+ * `reviewer` / `worker`) is shown in the footer status line (issue #17). It is
+ * recorded in memory only: the module is re-instantiated on every session
+ * transition, so the counter resets when a new or resumed session starts and
+ * no state is written to disk.
+ *
  * Forked from the official pi subagent example, modified for single-mode
  * clean return, bundled-role discovery, and default model inheritance.
  */
@@ -36,6 +42,13 @@ import { Type } from "typebox";
 import { type AgentConfig, discoverAgents } from "./agents.ts";
 import { resolveUserContextFile } from "./context-files.ts";
 import {
+	ROLE_STATUS_KEY,
+	emptyRoleCounts,
+	formatRoleCounts,
+	incrementRoleCounts,
+	type RoleCounts,
+} from "./role-counts.ts";
+import {
 	buildChainContent,
 	buildContent,
 	buildParallelContent,
@@ -47,6 +60,20 @@ import {
 const COLLAPSED_ITEM_COUNT = 10;
 const MAX_PARALLEL_TASKS = 4;
 const MAX_PARALLEL_CONCURRENCY = 3;
+
+// Per-session role invocation counters shown in the footer status line (issue #17).
+// This is intentionally in-memory only: the extension module is re-instantiated on
+// every session transition (/new, /resume, /fork, /reload), so these counters reset
+// automatically when a new or resumed session starts. No file I/O. The counting and
+// formatting helpers are pure (./role-counts.ts) so they can be unit-tested.
+let roleCounts: RoleCounts = emptyRoleCounts();
+let setRoleStatus: ((text: string) => void) | undefined;
+
+/** Render the per-role counter string and push it to the footer status line. */
+function renderRoleCounts(): void {
+	if (!setRoleStatus) return;
+	setRoleStatus(formatRoleCounts(roleCounts));
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -360,6 +387,12 @@ async function runSingleAgent(
 		}
 
 		args.push(`Task: ${task}`);
+
+		// Count an invocation when a role is actually dispatched to a subprocess.
+		// Unknown roles return earlier (no spawn), so they are never counted here.
+		roleCounts = incrementRoleCounts(roleCounts, agentName);
+		renderRoleCounts();
+
 		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -606,6 +639,15 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// Reset the per-session counters and re-establish the footer status when a
+	// session starts (or is reloaded). The module is re-instantiated per session,
+	// so this also clears any footer text left by the previous session.
+	pi.on("session_start", (_event, ctx) => {
+		roleCounts = emptyRoleCounts();
+		setRoleStatus = (text) => ctx.ui.setStatus(ROLE_STATUS_KEY, text);
+		renderRoleCounts();
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
