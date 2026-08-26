@@ -1,0 +1,1 @@
+/skill:writing-for-agents 将本次会话的成果总结成一个markdown放到 `.scratch/`目录，以便另一个agent能在其基础上继续工作。另外，如果有未提交的改动，则拟定一份合适的commit message，包含进去。
